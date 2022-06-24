@@ -16,6 +16,15 @@
 #include <time.h>
 #include <unistd.h>
 #define SSD_NAME "ssd_file"
+
+/*
+前半是block(nand)，>>16之後*10(PAGE_PER_BLOCK)
++這個bloack的lba就4index
+*/
+#define PCA_IDX(pca) ((pca & 0xffff) + ((pca >> 16) * PAGE_PER_BLOCK))
+
+void gomi_atsumeru();
+
 enum {
     SSD_NONE,
     SSD_ROOT,
@@ -40,7 +49,7 @@ union pca_rule {
 PCA_RULE curr_pca;
 static unsigned int get_next_pca();
 
-unsigned int *L2P, *P2L, *valid_count, free_block_number;
+unsigned int *L2P, *P2L, *valid_count, *pca_state, free_block_number;
 
 static int ssd_resize(size_t new_size) {
     // set logic size to new_size
@@ -91,6 +100,7 @@ static int nand_write(const char *buf, int pca) {
 
     // write
     if ((fptr = fopen(nand_name, "r+"))) {
+        /// 已經知道在nand的哪個blockㄌ，從他的page開始拿一個page
         fseek(fptr, my_pca.fields.lba * 512, SEEK_SET);
         fwrite(buf, 1, 512, fptr);
         fclose(fptr);
@@ -126,6 +136,11 @@ static unsigned int get_next_block() {
             curr_pca.fields.lba = 0;
             free_block_number--;
             valid_count[curr_pca.fields.nand] = 0;
+            /// 檢查現在拿到的已經是最後一塊空ㄉ
+            /// 該GCㄌ
+            if (free_block_number == 0) {
+                gomi_atsumeru();
+            }
             return curr_pca.pca;
         }
     }
@@ -156,11 +171,40 @@ static unsigned int get_next_pca() {
 }
 
 static int ftl_read(char *buf, size_t lba) {
-    // TODO
+    // TODO done
+    /// 一開始先找轉址，看有沒有這一塊
+    PCA_RULE rule;
+    rule.pca = L2P[lba];
+    if (rule.pca == INVALID_PCA) {
+        /// 找不到資料的區塊
+        perror("[WARNING] READ OUT OF BOUND!\n");
+        /// 不確定要不要重設0
+        memset(buf, 0, 512);
+        return 512;
+    }
+    return nand_read(buf, rule.pca);
 }
 
 static int ftl_write(const char *buf, size_t lba_rnage, size_t lba) {
     // TODO
+    int ret;
+    unsigned int pca;
+    int check = get_next_pca();
+    /// 如果拿不到下一塊
+    if (curr_pca.fields.lba == OUT_OF_BLOCK || check == -ENAVAIL) {
+        perror("[ERROR] CAN'T get_next_pca();\n");
+        return 0;
+    }
+    /// 舊ㄉ資料不要ㄌ，PCA要設為無效，然後把valid_count減少1
+    if (L2P[lba] != INVALID_PCA) {
+        P2L[PCA_IDX(L2P[lba])] = INVALID_LBA;
+        valid_count[((PCA_RULE)L2P[lba]).fields.nand]--;
+    }
+    ret = nand_write(buf, curr_pca.pca);
+    L2P[lba] = curr_pca.pca;
+    /// 紀錄phys對應到的lba
+    P2L[PCA_IDX(curr_pca.pca)] = lba;
+    return ret;
 }
 
 static int ssd_file_type(const char *path) {
@@ -213,15 +257,22 @@ static int ssd_do_read(char *buf, size_t size, off_t offset) {
         size = logic_size - offset;
     }
 
+    /// 起始位置是從第幾個 page開始
     tmp_lba = offset / 512;
+    /// 要讀幾次
     tmp_lba_range = (offset + size - 1) / 512 - (tmp_lba) + 1;
+    /// calloc，需共讀出幾個page的大小
     tmp_buf = calloc(tmp_lba_range * 512, sizeof(char));
 
     for (int i = 0; i < tmp_lba_range; i++) {
-        // TODO
+        // TODO done
+        /// 從offset的那塊page開時讀到tmp_buf的偏移位置上
+        ftl_read(tmp_buf + i * 512, tmp_lba + i);
     }
-
+    /// 因為一次就是讀取512byte，複製的時候要從第一塊的offset那邊開始傳回去
     memcpy(buf, tmp_buf + offset % 512, size);
+
+    printf("read_offset: %d\n", offset % 512);
 
     free(tmp_buf);
     return size;
@@ -244,14 +295,41 @@ static int ssd_do_write(const char *buf, size_t size, off_t offset) {
         return -ENOMEM;
     }
 
+    /// 跟read一樣先看是要寫到哪個block
     tmp_lba = offset / 512;
+    /// 算總共寫了幾個block
     tmp_lba_range = (offset + size - 1) / 512 - (tmp_lba) + 1;
 
     process_size = 0;
     remain_size = size;
     curr_size = 0;
+    tmp_buf = calloc(512, sizeof(char));
     for (idx = 0; idx < tmp_lba_range; idx++) {
         // TODO
+        int start = 0, end = 512;
+        /// 需特別處理第一塊，因為寫是一次寫整塊，要把原本的資料也抓出來
+        /// 另外，如果一開始的offset就是該塊的開頭，不用特別處理
+        if (idx == 0 && (offset % 512 != 0)) {
+            /// 第一塊的時候不用memset，因為一開始就用calloc來allocate
+            ftl_read(tmp_buf, tmp_lba + idx);
+            start = offset % 512;
+        }
+        /// 如果是最後一塊，看這次write寫完時沒有剛好一個block，就要特別處理
+        /// 阿如果最後一塊要寫整塊，也不用特別讀了
+        else if (idx == (tmp_lba_range - 1) && ((offset + size) % 512) != 0) {
+            ftl_read(tmp_buf, tmp_lba + idx);
+            end = (offset + size) % 512;
+        }
+        /// 第一塊時，可能會把讀到的資料的後半寫上新的
+        /// 最後一塊，可能把tmp_buf的前半蓋成這次要寫的
+        /// 不用顧慮是否要把頭尾串回來的話，直接寫整塊
+        for (int i = start; i < end; i++) {
+            tmp_buf[i] = buf[process_size++];
+        }
+        ftl_write(tmp_buf, 512, tmp_lba + idx);
+        /// 每次結束都先把tmp_buf清空
+        memset(tmp_buf, 0, 512 * sizeof(char));
+        printf("write_offset: %d\n", start);
     }
     return size;
 }
@@ -314,6 +392,42 @@ static int ssd_ioctl(const char *path, unsigned int cmd, void *arg,
     }
     return -EINVAL;
 }
+
+void gomi_atsumeru() {
+    unsigned int less_nand = (1 + curr_pca.fields.nand) % PHYSICAL_NAND_NUM;
+    /// 找最空的出來
+    for (int i = 1; i < PHYSICAL_NAND_NUM; i++) {
+        unsigned int idx = (i + curr_pca.fields.nand) % PHYSICAL_NAND_NUM;
+        if (idx == curr_pca.fields.nand)
+            continue;
+        if (valid_count[idx] < valid_count[less_nand]) {
+            less_nand = idx;
+        }
+    }
+    PCA_RULE less_pca;
+    less_pca.fields.nand = less_nand;
+    less_pca.fields.lba = 0;
+    char *buf[512];
+    /// 然後就把那個block上有用的資料都搬出來
+    for (int i = 0; i < PAGE_PER_BLOCK; i++) {
+        less_pca.fields.lba = i;
+        /// 取出p2l的index
+        int idx = PCA_IDX(less_pca.pca);
+        unsigned int lba = P2L[idx];
+        if (P2L[idx] == INVALID_LBA)
+            continue;
+        nand_read(buf, less_pca.pca);
+        /// 把資料寫到當前pca
+        nand_write(buf, curr_pca.pca);
+        L2P[lba] = curr_pca.pca;
+        P2L[PCA_IDX(curr_pca.pca)] = lba;
+        P2L[idx] = INVALID_LBA;
+        curr_pca.fields.lba++;
+    }
+    nand_erase(less_nand);
+    free_block_number++;
+}
+
 static const struct fuse_operations ssd_oper =
     {
         .getattr = ssd_getattr,
@@ -333,11 +447,16 @@ int main(int argc, char *argv[]) {
     free_block_number = PHYSICAL_NAND_NUM;
 
     L2P = malloc(LOGICAL_NAND_NUM * PAGE_PER_BLOCK * sizeof(int));
+    /// memset不是看一byteㄇ，怎麼一次填4byte
     memset(L2P, INVALID_PCA, sizeof(int) * LOGICAL_NAND_NUM * PAGE_PER_BLOCK);
     P2L = malloc(PHYSICAL_NAND_NUM * PAGE_PER_BLOCK * sizeof(int));
+    /// memset不是看一byteㄇ，怎麼一次填4byte
     memset(P2L, INVALID_LBA, sizeof(int) * PHYSICAL_NAND_NUM * PAGE_PER_BLOCK);
     valid_count = malloc(PHYSICAL_NAND_NUM * sizeof(int));
     memset(valid_count, FREE_BLOCK, sizeof(int) * PHYSICAL_NAND_NUM);
+
+    pca_state = malloc(LOGICAL_NAND_NUM * PAGE_PER_BLOCK * sizeof(int));
+    memset(pca_state, 0xFF, sizeof(int) * LOGICAL_NAND_NUM * PAGE_PER_BLOCK);
 
     // create nand file
     for (idx = 0; idx < PHYSICAL_NAND_NUM; idx++) {

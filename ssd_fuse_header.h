@@ -17,7 +17,7 @@
 #define OUT_OF_BLOCK      (0xFFFF)
 #define FULL_PCA          (0xFFFFFFFE)
 #define PAGE_PER_BLOCK    (10)
-#define NAND_LOCATION     "/mnt/hgfs/ssd_fuse_lab"
+#define NAND_LOCATION     "/tmp/ssd_fuse_lab"
 
 enum {
     SSD_GET_LOGIC_SIZE = _IOR('E', 0, size_t),

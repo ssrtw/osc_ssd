@@ -6,7 +6,7 @@ ssd_fuse: ssd_fuse.c ssd_fuse_header.h
 ssd_fuse_dut: ssd_fuse_dut.c ssd_fuse_header.h
 	gcc -Wall ssd_fuse_dut.c -o ssd_fuse_dut
 clean:
-	rm ssd_fuse ssd_fuse_dut
+	rm ssd_fuse ssd_fuse_dut nand_* >/dev/null 2>/dev/null || true
 mount: ssd_fuse
 	mkdir -p $(TMPDIR)
 	./ssd_fuse -d /tmp/ssd
